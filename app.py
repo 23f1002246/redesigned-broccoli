@@ -22,6 +22,7 @@ import hashlib
 import base64
 import logging
 import shutil
+import os
 import subprocess
 from pathlib import Path
 from threading import Thread
