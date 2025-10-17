@@ -1,29 +1,19 @@
 """
 app.py
 
-A single-file Flask app that implements the student API for the LLM Code Deployment project.
+A single-file Flask app for the LLM Code Deployment project.
 
 Features:
 - Accepts POST JSON tasks (round 1 and round 2)
-- Verifies `PROJECT_SECRET` env var
+- Verifies secret from secrets.py
 - Decodes data: URI attachments
-- Generates minimal static site from a template (index.html, README.md, LICENSE)
+- Generates minimal static site (index.html, README.md, LICENSE)
 - Uses git + gh CLI to create public repo and push
 - Enables GitHub Pages via gh CLI
-- Polls pages_url until HTTP 200 (timeout configurable)
-- Posts back to evaluation_url with repo metadata, with exponential backoff
-
-Assumptions / Requirements:
-- `gh` CLI installed and authenticated (`gh auth login` or GH_TOKEN configured)
-- Environment variables:
-    PROJECT_SECRET  (string student secret)
-    GITHUB_USER     (your GitHub username)
-    GIT_AUTHOR_NAME (optional)
-    GIT_AUTHOR_EMAIL(optional)
-- Python packages: flask, requests, python-dotenv
+- Polls pages_url until HTTP 200
+- Posts back to evaluation_url with repo metadata
 """
 
-import os
 import re
 import io
 import json
@@ -34,25 +24,26 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
+from threading import Thread
 
 import requests
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
 
-# --- Load environment variables from .env file ---
-load_dotenv()
+# --- Import configuration/secrets ---
+from secrets import (
+    PROJECT_SECRET,
+    GITHUB_USER,
+    GIT_AUTHOR_NAME,
+    GIT_AUTHOR_EMAIL,
+    PAGES_POLL_TIMEOUT,
+    PAGES_POLL_INTERVAL,
+    WORK_DIR,
+)
 
-# --- Configuration ---
-PROJECT_SECRET = os.getenv("PROJECT_SECRET")
-GITHUB_USER = os.getenv("GITHUB_USER")
-GIT_AUTHOR_NAME = os.getenv("GIT_AUTHOR_NAME", GITHUB_USER)
-GIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "")
-PAGES_POLL_TIMEOUT = int(os.getenv("PAGES_POLL_TIMEOUT", "180"))
-PAGES_POLL_INTERVAL = int(os.getenv("PAGES_POLL_INTERVAL", "3"))
-WORK_DIR = Path(os.getenv("WORK_DIR", "./work"))
+WORK_DIR = Path(WORK_DIR)
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("deployer")
 
@@ -122,10 +113,9 @@ def generate_index_html(task: str, brief: str, attachments: list) -> str:
   <div id="result">(no result yet)</div>
 
   <script>
-    function q(n){{return new URLSearchParams(location.search).get(n);}}
+    function q(n) {{return new URLSearchParams(location.search).get(n);}}
     const url = q('url') || '';
-    if(url) document.getElementById('source-url').textContent = url;
-    else document.getElementById('source-url').textContent = 'attachment fallback';
+    document.getElementById('source-url').textContent = url || 'attachment fallback';
     setTimeout(()=>{{ document.getElementById('result').textContent = 'SAMPLE-SOLUTION'; }}, 800);
   </script>
 </body>
@@ -155,7 +145,7 @@ MIT
 """
 
 
-def create_repo_worktree(task: str, brief: str, attachments: list) -> Path:
+def create_repo_worktree(task: str, brief: str, attachments: list) -> tuple:
     seed = brief + "".join(a.get("url", "") for a in (attachments or []))
     name_safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", task)[:40]
     repo_name = f"task-{name_safe}-{short_hash(seed)}"
@@ -165,12 +155,14 @@ def create_repo_worktree(task: str, brief: str, attachments: list) -> Path:
         shutil.rmtree(repo_path)
     repo_path.mkdir(parents=True)
 
+    # Write files
     (repo_path / "index.html").write_text(
         generate_index_html(task, brief, attachments or [])
     )
     (repo_path / "README.md").write_text(generate_readme(task, brief))
     write_license(repo_path / "LICENSE")
 
+    # Decode attachments
     for att in attachments or []:
         try:
             data = decode_data_uri(att["url"])
@@ -183,16 +175,19 @@ def create_repo_worktree(task: str, brief: str, attachments: list) -> Path:
 
 
 def git_init_commit_push(repo_path: Path, repo_name: str):
-    env = os.environ.copy()
-    if GIT_AUTHOR_NAME:
-        env["GIT_AUTHOR_NAME"] = GIT_AUTHOR_NAME
-    if GIT_AUTHOR_EMAIL:
-        env["GIT_AUTHOR_EMAIL"] = GIT_AUTHOR_EMAIL
+    env = None
+    if GIT_AUTHOR_NAME or GIT_AUTHOR_EMAIL:
+        env = os.environ.copy()
+        if GIT_AUTHOR_NAME:
+            env["GIT_AUTHOR_NAME"] = GIT_AUTHOR_NAME
+        if GIT_AUTHOR_EMAIL:
+            env["GIT_AUTHOR_EMAIL"] = GIT_AUTHOR_EMAIL
 
     run_checked(["git", "init"], cwd=str(repo_path))
     run_checked(["git", "add", "."], cwd=str(repo_path))
     run_checked(["git", "commit", "-m", "Initial commit"], cwd=str(repo_path))
     run_checked(["git", "branch", "-M", "main"], cwd=str(repo_path))
+
     run_checked(
         [
             "gh",
@@ -229,11 +224,10 @@ def poll_pages_url(
     while time.time() < deadline:
         try:
             r = requests.get(pages_url, timeout=5)
-            logger.info("Pages status: %s", r.status_code)
             if r.status_code == 200:
                 return True
-        except Exception as e:
-            logger.debug("Pages poll error: %s", e)
+        except Exception:
+            pass
         time.sleep(interval)
     return False
 
@@ -246,17 +240,16 @@ def notify_evaluation(evaluation_url: str, payload: dict, max_attempts: int = 6)
             resp = requests.post(
                 evaluation_url, json=payload, headers=headers, timeout=10
             )
-            logger.info("Notify attempt %d -> %s", attempt + 1, resp.status_code)
             if resp.status_code == 200:
                 return True
-        except Exception as e:
-            logger.warning("Notify error: %s", e)
-        backoff = 2**attempt
-        time.sleep(backoff)
+        except Exception:
+            pass
+        time.sleep(2**attempt)
         attempt += 1
     return False
 
 
+# --- Flask endpoints ---
 @app.route("/api", methods=["POST"])
 def api_handler():
     data = request.get_json(silent=True)
@@ -269,23 +262,14 @@ def api_handler():
             return jsonify({"error": f"missing {k}"}), 400
 
     if PROJECT_SECRET is None:
-        logger.error("PROJECT_SECRET not set in environment")
+        logger.error("PROJECT_SECRET not set")
         return jsonify({"error": "server misconfigured"}), 500
 
     if data.get("secret") != PROJECT_SECRET:
         return jsonify({"error": "invalid secret"}), 400
 
     ack = {"status": "ok", "task": data.get("task"), "round": data.get("round")}
-
-    from threading import Thread
-
-    def worker(payload):
-        try:
-            _do_pipeline(payload)
-        except Exception as e:
-            logger.exception("Pipeline failed: %s", e)
-
-    Thread(target=worker, args=(data,), daemon=True).start()
+    Thread(target=_do_pipeline, args=(data,), daemon=True).start()
     return jsonify(ack), 200
 
 
@@ -301,11 +285,9 @@ def _do_pipeline(data: dict):
     repo_path, repo_name = create_repo_worktree(task, brief, attachments)
     sha = git_init_commit_push(repo_path, repo_name)
     enable_pages(repo_name)
-
     pages_url = f"https://{GITHUB_USER}.github.io/{repo_name}/"
 
-    live = poll_pages_url(pages_url)
-    if not live:
+    if not poll_pages_url(pages_url):
         logger.warning("Pages did not become live within timeout for %s", repo_name)
 
     payload = {
@@ -318,8 +300,7 @@ def _do_pipeline(data: dict):
         "pages_url": pages_url,
     }
 
-    ok = notify_evaluation(evaluation_url, payload)
-    if not ok:
+    if not notify_evaluation(evaluation_url, payload):
         logger.error("Failed to notify evaluation for %s", repo_name)
 
 
@@ -330,9 +311,6 @@ def health():
 
 if __name__ == "__main__":
     if PROJECT_SECRET is None or GITHUB_USER is None:
-        logger.error(
-            "Missing PROJECT_SECRET or GITHUB_USER. Set environment variables before running."
-        )
-        print("Missing PROJECT_SECRET or GITHUB_USER environment variables. Exiting.")
+        logger.error("Missing PROJECT_SECRET or GITHUB_USER in secrets.py")
         raise SystemExit(1)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
