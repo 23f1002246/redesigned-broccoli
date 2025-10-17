@@ -13,17 +13,14 @@ Features:
 - Polls pages_url until HTTP 200 (timeout configurable)
 - Posts back to evaluation_url with repo metadata, with exponential backoff
 
-Assumptions / Requirements (you must configure these on the deployment host):
-- `gh` CLI is installed and authenticated for the GitHub account (interactive `gh auth login` or GH_TOKEN in environment configured for CI)
-- Environment variables set:
-    PROJECT_SECRET  (string student secret submitted in Google Form)
+Assumptions / Requirements:
+- `gh` CLI installed and authenticated (`gh auth login` or GH_TOKEN configured)
+- Environment variables:
+    PROJECT_SECRET  (string student secret)
     GITHUB_USER     (your GitHub username)
-    GIT_AUTHOR_NAME (optional, name to use for commits)
-    GIT_AUTHOR_EMAIL(optional, email to use for commits)
-- Python packages: flask, requests
-
-Note: This is intentionally a minimal, pragmatic implementation to meet the project requirements quickly.
-
+    GIT_AUTHOR_NAME (optional)
+    GIT_AUTHOR_EMAIL(optional)
+- Python packages: flask, requests, python-dotenv
 """
 
 import os
@@ -41,27 +38,27 @@ from urllib.parse import urlparse
 
 import requests
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+
+# --- Load environment variables from .env file ---
+load_dotenv()
 
 # --- Configuration ---
 PROJECT_SECRET = os.getenv("PROJECT_SECRET")
 GITHUB_USER = os.getenv("GITHUB_USER")
 GIT_AUTHOR_NAME = os.getenv("GIT_AUTHOR_NAME", GITHUB_USER)
 GIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "")
-# How long to poll pages (seconds)
 PAGES_POLL_TIMEOUT = int(os.getenv("PAGES_POLL_TIMEOUT", "180"))
 PAGES_POLL_INTERVAL = int(os.getenv("PAGES_POLL_INTERVAL", "3"))
-# Where to store temporary repo worktrees
 WORK_DIR = Path(os.getenv("WORK_DIR", "./work"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("deployer")
 
 app = Flask(__name__)
 
 # --- Helpers ---
-
 DATA_URI_RE = re.compile(
     r"data:([\w/+-\.]+)?(?:;charset=[^;]+)?(?:;base64)?,(.*)", re.S
 )
@@ -75,13 +72,10 @@ def decode_data_uri(data_uri: str) -> bytes:
     m = DATA_URI_RE.match(data_uri)
     if not m:
         raise ValueError("invalid data URI")
-    # group 1 is mime type (ignored here), group 2 is data
     data = m.group(2)
-    # data may be urlencoded; base64 is typical for attachments
     try:
         return base64.b64decode(data)
     except Exception:
-        # fallback: try unquoted
         return data.encode("utf-8")
 
 
@@ -114,7 +108,6 @@ def write_license(path: Path):
 
 
 def generate_index_html(task: str, brief: str, attachments: list) -> str:
-    # Minimal template: displays brief and shows ?url= param. Also places #result element.
     return f"""<!doctype html>
 <html>
 <head>
@@ -133,7 +126,6 @@ def generate_index_html(task: str, brief: str, attachments: list) -> str:
     const url = q('url') || '';
     if(url) document.getElementById('source-url').textContent = url;
     else document.getElementById('source-url').textContent = 'attachment fallback';
-    // Example simulated solver — replace with real logic if generator implements it
     setTimeout(()=>{{ document.getElementById('result').textContent = 'SAMPLE-SOLUTION'; }}, 800);
   </script>
 </body>
@@ -173,14 +165,12 @@ def create_repo_worktree(task: str, brief: str, attachments: list) -> Path:
         shutil.rmtree(repo_path)
     repo_path.mkdir(parents=True)
 
-    # Write files
     (repo_path / "index.html").write_text(
         generate_index_html(task, brief, attachments or [])
     )
     (repo_path / "README.md").write_text(generate_readme(task, brief))
     write_license(repo_path / "LICENSE")
 
-    # Decode attachments
     for att in attachments or []:
         try:
             data = decode_data_uri(att["url"])
@@ -193,7 +183,6 @@ def create_repo_worktree(task: str, brief: str, attachments: list) -> Path:
 
 
 def git_init_commit_push(repo_path: Path, repo_name: str):
-    # configure git author
     env = os.environ.copy()
     if GIT_AUTHOR_NAME:
         env["GIT_AUTHOR_NAME"] = GIT_AUTHOR_NAME
@@ -204,9 +193,6 @@ def git_init_commit_push(repo_path: Path, repo_name: str):
     run_checked(["git", "add", "."], cwd=str(repo_path))
     run_checked(["git", "commit", "-m", "Initial commit"], cwd=str(repo_path))
     run_checked(["git", "branch", "-M", "main"], cwd=str(repo_path))
-
-    # create repo via gh and push
-    # gh repo create <repo> --public --source=. --remote=origin --push
     run_checked(
         [
             "gh",
@@ -221,7 +207,6 @@ def git_init_commit_push(repo_path: Path, repo_name: str):
         cwd=str(repo_path),
     )
 
-    # get commit sha
     sha = (
         subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_path))
         .decode()
@@ -231,7 +216,6 @@ def git_init_commit_push(repo_path: Path, repo_name: str):
 
 
 def enable_pages(repo_name: str):
-    # gh repo edit <repo> --enable-pages
     run_checked(["gh", "repo", "edit", repo_name, "--enable-pages"])
 
 
@@ -273,16 +257,12 @@ def notify_evaluation(evaluation_url: str, payload: dict, max_attempts: int = 6)
     return False
 
 
-# --- Flask endpoints ---
-
-
 @app.route("/api", methods=["POST"])
 def api_handler():
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "invalid json"}), 400
 
-    # immediate required fields
     required = ["email", "secret", "task", "round", "nonce", "brief", "evaluation_url"]
     for k in required:
         if k not in data:
@@ -295,11 +275,7 @@ def api_handler():
     if data.get("secret") != PROJECT_SECRET:
         return jsonify({"error": "invalid secret"}), 400
 
-    # ACK immediately
     ack = {"status": "ok", "task": data.get("task"), "round": data.get("round")}
-    # spawn the work synchronously after ack (Flask will return after function ends, but we must
-    # continue doing background tasks). For simplicity in this single-file implementation, we will
-    # perform the pipeline after returning the ack to the caller by using a short-lived thread.
 
     from threading import Thread
 
@@ -310,7 +286,6 @@ def api_handler():
             logger.exception("Pipeline failed: %s", e)
 
     Thread(target=worker, args=(data,), daemon=True).start()
-
     return jsonify(ack), 200
 
 
@@ -323,13 +298,8 @@ def _do_pipeline(data: dict):
     evaluation_url = data["evaluation_url"]
     attachments = data.get("attachments", [])
 
-    # Create worktree
     repo_path, repo_name = create_repo_worktree(task, brief, attachments)
-
-    # Init, commit and push
     sha = git_init_commit_push(repo_path, repo_name)
-
-    # Enable pages
     enable_pages(repo_name)
 
     pages_url = f"https://{GITHUB_USER}.github.io/{repo_name}/"
@@ -352,17 +322,13 @@ def _do_pipeline(data: dict):
     if not ok:
         logger.error("Failed to notify evaluation for %s", repo_name)
 
-    # For round 2: nothing special here — instructors will post again with round=2 and new brief.
 
-
-# --- Health check ---
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
-    # sanity checks
     if PROJECT_SECRET is None or GITHUB_USER is None:
         logger.error(
             "Missing PROJECT_SECRET or GITHUB_USER. Set environment variables before running."
